@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fleet-track.local/schemas/gps-event/v1.0.0",
+  "title": "GpsEvent",
+  "description": "Payload canônico de telemetria GPS para o sistema Fleet Track. SSOT v1.0.0 — definido em .skills/architect/data-contracts.md. Publicado pela API de Ingestão na exchange tx.logistics.main com routing key 'pinheirinho.gps.raw'.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": [
+    "veiculo_id",
+    "placa",
+    "lat",
+    "lng",
+    "timestamp"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "veiculo_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUID v4 do veículo. Utilizado como parte da chave de idempotência no Redis: '{veiculo_id}:{timestamp}' com TTL de 5 minutos. Se a chave já existir, o evento é descartado silenciosamente (não publicado na fila).",
+      "examples": [
+        "550e8400-e29b-41d4-a716-446655440000"
+      ]
+    },
+    "placa": {
+      "type": "string",
+      "description": "Placa do veículo. Aceita formato Mercosul (ABC1D23) ou formato antigo (ABC-1234). A validação garante que apenas veículos cadastrados sejam aceitos.",
+      "pattern": "^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$|^[A-Z]{3}-[0-9]{4}$",
+      "examples": [
+        "ABC1D23",
+        "ABC-1234"
+      ]
+    },
+    "lat": {
+      "type": "number",
+      "description": "Latitude WGS84 do veículo. Restrita ao bounding box de Curitiba (PR) conforme regra de negócio: área de monitoramento é o bairro Pinheirinho. Coordenadas fora deste range indicam erro de sensor ou veículo fora da área.",
+      "minimum": -25.65,
+      "maximum": -25.35,
+      "examples": [
+        -25.5163
+      ]
+    },
+    "lng": {
+      "type": "number",
+      "description": "Longitude WGS84 do veículo. Restrita ao bounding box de Curitiba (PR). Utilizada em conjunto com 'lat' para cálculo de ST_Within(geofence) no tracking-worker via PostGIS.",
+      "minimum": -49.42,
+      "maximum": -49.18,
+      "examples": [
+        -49.2916
+      ]
+    },
+    "velocidade": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "Velocidade instantânea do veículo em km/h. null indica que o sensor de velocidade está offline ou não disponível. Utilizado para detecção de excesso de velocidade e alertas comportamentais.",
+      "minimum": 0,
+      "maximum": 300,
+      "examples": [
+        45.5,
+        0,
+        null
+      ]
+    },
+    "ignicao": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "Estado da ignição do veículo. true = ligado, false = desligado, null = sensor não disponível. Crítico para detecção de veículos ligados parados dentro de geofences restritas.",
+      "examples": [
+        true,
+        false,
+        null
+      ]
+    },
+    "heading": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "Direção de deslocamento em graus (bearing). 0 = Norte, 90 = Leste, 180 = Sul, 270 = Oeste. null indica que o heading não está disponível (veículo parado ou sensor ausente).",
+      "minimum": 0,
+      "maximum": 359,
+      "examples": [
+        0,
+        90,
+        180,
+        270,
+        null
+      ]
+    },
+    "precisao_metros": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "Precisão estimada do sinal GPS em metros. Valores acima de 50 indicam sinal degradado (área urbana densa, túnel, interferência). null indica que a métrica não está disponível no dispositivo.",
+      "minimum": 0,
+      "examples": [
+        5.2,
+        15.0,
+        50.1,
+        null
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Timestamp de captura da coordenada GPS em ISO 8601 UTC (ex: 2026-03-28T14:30:00.000Z). Utilizado em conjunto com veiculo_id como chave de idempotência no Redis. Crítico: deve ser gerado pelo dispositivo GPS, não pelo servidor de ingestão.",
+      "examples": [
+        "2026-03-28T14:30:00.000Z",
+        "2026-03-28T14:30:00Z"
+      ]
+    }
+  },
+  "examples": [
+    {
+      "veiculo_id": "550e8400-e29b-41d4-a716-446655440000",
+      "placa": "ABC1D23",
+      "lat": -25.5163,
+      "lng": -49.2916,
+      "velocidade": 45.5,
+      "ignicao": true,
+      "heading": 90,
+      "precisao_metros": 5.2,
+      "timestamp": "2026-03-28T14:30:00.000Z"
+    },
+    {
+      "veiculo_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+      "placa": "XYZ-9876",
+      "lat": -25.5500,
+      "lng": -49.3200,
+      "velocidade": null,
+      "ignicao": false,
+      "heading": null,
+      "precisao_metros": null,
+      "timestamp": "2026-03-28T14:31:00.000Z"
+    }
+  ]
+}

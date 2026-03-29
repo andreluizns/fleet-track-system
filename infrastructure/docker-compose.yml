@@ -1,0 +1,200 @@
+# =============================================================================
+# Fleet Track — Docker Compose (Infraestrutura de Serviços Base)
+# =============================================================================
+# Orquestração local de: PostgreSQL/PostGIS, Redis e RabbitMQ
+#
+# Uso:
+#   cp .env.example .env && docker compose up -d
+#
+# Atenção: As credenciais são lidas do arquivo .env (nunca hardcode em prod).
+# Protocolo de Emergência: todos os serviços possuem restart: unless-stopped
+# e healthchecks ativos, conforme definido em .agents/emergency-protocol.md
+# =============================================================================
+
+version: "3.9"
+
+# ---------------------------------------------------------------------------
+# Rede interna isolada — todos os serviços se comunicam aqui.
+# Redis NÃO expõe porta para o host (segurança por design).
+# ---------------------------------------------------------------------------
+networks:
+  fleet_network:
+    driver: bridge
+    name: fleet_network
+
+# ---------------------------------------------------------------------------
+# Volumes persistentes — dados sobrevivem ao restart/recreate dos containers.
+# ---------------------------------------------------------------------------
+volumes:
+  rabbitmq_data:
+    driver: local
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+  grafana_data:
+
+services:
+
+  # -------------------------------------------------------------------------
+  # RabbitMQ 3.13 — Message Broker (AMQP)
+  # Topologia de exchanges/filas definida em: contracts/rabbitmq-topology.jsonc
+  # Provisionamento automático via: scripts/setup-rabbitmq.sh
+  # -------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: fleet_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+      # Habilita log estruturado para facilitar ingestão no Loki/Prometheus
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit log [{console,[{level,info}]}]"
+      RABBITMQ_ENABLED_PLUGINS_FILE: /etc/rabbitmq/enabled_plugins
+    ports:
+      # AMQP — protocolo de mensageria utilizado pela API e Worker
+      - "5672:5672"
+      # Management UI — restringir por IP em produção (ver ufw-setup.sh)
+      - "15672:15672"
+      # Prometheus metrics endpoint (plugin rabbitmq_prometheus)
+      - "15692:15692"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./rabbitmq-plugins:/etc/rabbitmq/enabled_plugins:ro
+    networks:
+      - fleet_network
+    healthcheck:
+      # Verifica conectividade TCP na porta AMQP (nível de socket, rápido)
+      # Conforme emergency-protocol.md: probe deve verificar se a porta aceita conexões
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/localhost/5672"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL 16 + PostGIS 3.4 — Persistência Geoespacial
+  # Extensão PostGIS obrigatória para ST_Within (geofencing em tempo real)
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: fleet_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Garante que o locale seja UTF-8 para caracteres especiais em nomes/logradouros
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # Expõe para o host para acesso de ferramentas locais (DBeaver, psql).
+      # Em produção, restringir por IP via UFW (ver ufw-setup.sh).
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - fleet_network
+    healthcheck:
+      # pg_isready verifica se o servidor aceita conexões (mais confiável que TCP)
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -------------------------------------------------------------------------
+  # Redis 7 Alpine — Cache de Idempotência e Estado em Tempo Real
+  # Utilizado para chave de idempotência: {veiculo_id}:{timestamp} (TTL 5 min)
+  # Conforme data-contracts.md: chave Redis previne alertas duplicados
+  #
+  # SEGURANÇA: Redis NÃO expõe porta externa — comunicação apenas via
+  # fleet_network interna. Isso impede acesso direto da internet/host.
+  # -------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: fleet_redis
+    restart: unless-stopped
+    ports:
+      # Expõe para o host para que os serviços Node.js (fora do Docker) consigam conectar
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - fleet_network
+    # Habilita persistência AOF para sobreviver a restarts (não perder estado de idempotência)
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      # redis-cli ping retorna PONG quando o servidor está saudável
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # -------------------------------------------------------------------------
+  # Prometheus — Coleta de Métricas
+  # Raspa métricas dos serviços Node.js locais via host.docker.internal
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: fleet_prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - fleet_network
+
+  # -------------------------------------------------------------------------
+  # Grafana — Visualização de Métricas e Dashboards
+  # -------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.2
+    container_name: fleet_grafana
+    restart: unless-stopped
+    ports:
+      - "3003:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=fleet_grafana
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3003
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    networks:
+      - fleet_network
+
+  # -------------------------------------------------------------------------
+  # PostgreSQL Exporter — Exporta métricas do Postgres para o Prometheus
+  # -------------------------------------------------------------------------
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: fleet_postgres_exporter
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - fleet_network

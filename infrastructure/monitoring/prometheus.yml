@@ -1,0 +1,35 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: 'fleet-track'
+    environment: 'development'
+
+scrape_configs:
+  # API de Ingestão GPS (Node.js local)
+  - job_name: 'api-ingestao'
+    static_configs:
+      - targets: ['host.docker.internal:3000']
+    metrics_path: /metrics
+
+  # Tracking Worker + Socket.io (Node.js local)
+  - job_name: 'tracking-worker'
+    static_configs:
+      - targets: ['host.docker.internal:3001']
+    metrics_path: /metrics
+
+  # RabbitMQ Prometheus Exporter (plugin nativo do management)
+  - job_name: 'rabbitmq'
+    static_configs:
+      - targets: ['rabbitmq:15692']
+    metrics_path: /metrics
+
+  # PostgreSQL Exporter
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # O próprio Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

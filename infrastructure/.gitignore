@@ -1,0 +1,20 @@
+# =============================================================================
+# Fleet Track — .gitignore da Infraestrutura
+# =============================================================================
+# Impede que credenciais e segredos sejam commitados acidentalmente.
+# O arquivo .env.example deve ser commitado como template (sem valores reais).
+# =============================================================================
+
+# Arquivo de variáveis de ambiente com credenciais reais
+# Copie .env.example para .env e preencha com os valores reais localmente.
+.env
+
+# Variações de ambiente específicas também ignoradas por segurança
+.env.local
+.env.production
+.env.staging
+.env.development.local
+.env.test.local
+.env.production.local
+
+# .env.example NÃO está listado aqui — ele DEVE ser commitado como template

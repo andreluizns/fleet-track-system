@@ -1,0 +1,203 @@
+// =============================================================================
+// Fleet Track — Topologia RabbitMQ (SSOT v1.0.0)
+// =============================================================================
+// Este arquivo documenta a topologia completa de mensageria do sistema.
+// SSOT (Single Source of Truth) — definido pelo Arquiteto em:
+//   .skills/architect/data-contracts.md
+//
+// Script de provisionamento: scripts/setup-rabbitmq.sh
+// Contrato de payload:       contracts/gps-event.schema.json
+//
+// Fluxo resumido:
+//   [Dispositivo GPS]
+//     → POST /api/v1/gps
+//     → [API de Ingestão] valida GpsEvent v1.0.0 + checa idempotência Redis
+//     → publish "pinheirinho.gps.raw" → [tx.logistics.main]
+//     → [q.pinheirinho.gps.raw] → [tracking-worker]
+//     → ST_Within(geofence)? SIM → publish "pinheirinho.alert.geofence"
+//                                → [q.pinheirinho.alert.geofence]
+//                                → [notification-service] → WebSocket → Frontend
+//     → Persiste em gps_events (PostGIS) → ACK
+// =============================================================================
+{
+  "metadata": {
+    "version": "1.0.0",
+    "sistema": "Fleet Track",
+    "vhost": "/",
+    "ultima_revisao": "2026-03-28",
+    "responsavel": "Arquiteto de Soluções + DevOps SRE"
+  },
+
+  // ---------------------------------------------------------------------------
+  // EXCHANGES
+  // Exchanges são roteadores: recebem mensagens e as encaminham para filas
+  // com base no tipo e na routing key.
+  // ---------------------------------------------------------------------------
+  "exchanges": [
+    {
+      "name": "tx.logistics.main",
+      // Tipo "topic" permite routing por padrão com wildcards (* e #)
+      // Padrão de routing key: {regiao}.{tipo_evento}.{severidade}
+      // Exemplo: "pinheirinho.gps.raw", "pinheirinho.alert.geofence"
+      // Wildcards: "*" = uma palavra, "#" = zero ou mais palavras
+      "type": "topic",
+      "durable": true,       // Sobrevive ao restart do broker
+      "auto_delete": false,  // Não é removida quando não há consumers
+      "internal": false,     // Pode receber mensagens de publishers externos
+      "description": "Exchange principal do sistema. Recebe todos os eventos de telemetria GPS e alertas. A API de Ingestão publica aqui após validação do GpsEvent v1.0.0 e checagem de idempotência no Redis.",
+      "routing_key_pattern": "{regiao}.{tipo_evento}",
+      "publishers": [
+        "api-ingestao (GPS raw)",
+        "tracking-worker (alertas geofence)"
+      ]
+    },
+    {
+      "name": "tx.logistics.dlx",
+      // Tipo "direct" para Dead Letter Exchange: routing key exata, sem wildcards
+      // Mensagens chegam aqui em dois cenários:
+      //   1. TTL expirado: mensagem ficou na fila além do x-message-ttl
+      //   2. NACK com requeue=false: worker rejeitou após retries esgotados
+      "type": "direct",
+      "durable": true,
+      "auto_delete": false,
+      "internal": false,
+      "description": "Dead Letter Exchange (DLX). Recebe mensagens que expiraram por TTL ou foram rejeitadas com NACK(requeue=false) pelo tracking-worker. Roteadas para q.logistics.dead-letter para auditoria e análise pelo time DevOps.",
+      "publishers": [
+        "RabbitMQ (automático via x-dead-letter-exchange nas filas)"
+      ]
+    }
+  ],
+
+  // ---------------------------------------------------------------------------
+  // QUEUES (FILAS)
+  // Filas armazenam mensagens até serem consumidas.
+  // Todas são durable=true: persistidas em disco, sobrevivem a restarts.
+  // ---------------------------------------------------------------------------
+  "queues": [
+    {
+      "name": "q.pinheirinho.gps.raw",
+      "durable": true,
+      "auto_delete": false,
+      "description": "Fila principal de coordenadas GPS brutas do bairro Pinheirinho (Curitiba-PR). Consumida exclusivamente pelo tracking-worker para processamento de geofencing via PostGIS.",
+
+      // Políticas de TTL e Dead Letter
+      "arguments": {
+        // x-message-ttl: 300000ms = 5 minutos
+        // Justificativa: coordenadas GPS com mais de 5 minutos não têm valor
+        // operacional para monitoramento em tempo real. Expirar evita acúmulo
+        // de backlog obsoleto em caso de falha do tracking-worker.
+        "x-message-ttl": 300000,
+        "x-ttl_human": "5 minutos",
+
+        // x-dead-letter-exchange: quando uma mensagem expira ou é NACKada
+        // (requeue=false), é automaticamente roteada para a DLX.
+        "x-dead-letter-exchange": "tx.logistics.dlx",
+
+        // Routing key específica na DLX para facilitar filtragem de auditoria.
+        "x-dead-letter-routing-key": "q.pinheirinho.gps.raw.dead"
+      },
+
+      "consumer": "tracking-worker",
+      "ack_policy": {
+        // Conforme emergency-protocol.md e data-contracts.md:
+        "persistencia_ok": "ACK — mensagem removida da fila",
+        "falha_db": "NACK + requeue=true — permanece na fila até DB normalizar",
+        "retries_esgotados": "NACK + requeue=false → DLX → q.logistics.dead-letter"
+      }
+    },
+    {
+      "name": "q.pinheirinho.alert.geofence",
+      "durable": true,
+      "auto_delete": false,
+      "description": "Fila de alertas de violação de geofence (Cerca Eletrônica) do bairro Pinheirinho. Consumida pelo notification-service para emissão de eventos WebSocket ao frontend Next.js em tempo real.",
+
+      "arguments": {
+        // x-message-ttl: 60000ms = 1 minuto
+        // Justificativa: alertas de geofence são urgentes e time-sensitive.
+        // Um alerta com mais de 1 minuto já não tem valor operacional para
+        // o despachante (motorista já saiu da área). Expirar evita spam de
+        // notificações obsoletas no frontend.
+        "x-message-ttl": 60000,
+        "x-ttl_human": "1 minuto",
+
+        "x-dead-letter-exchange": "tx.logistics.dlx",
+        "x-dead-letter-routing-key": "q.pinheirinho.alert.geofence.dead"
+      },
+
+      "consumer": "notification-service",
+      "websocket_event": "alerta_geofence",
+      "payload_emitido": {
+        "veiculo_id": "string (uuid)",
+        "placa": "string",
+        "geofence_id": "string (uuid)",
+        "geofence_name": "string",
+        "tipo": "entry | exit",
+        "timestamp": "string (ISO 8601)"
+      }
+    },
+    {
+      "name": "q.logistics.dead-letter",
+      "durable": true,
+      "auto_delete": false,
+      "description": "Dead Letter Queue (DLQ). Armazena todas as mensagens que falharam no processamento ou expiraram nas filas operacionais. Não possui TTL — mensagens devem ser retidas para análise post-mortem pelo time DevOps. Monitorada via Prometheus + alertas no Grafana.",
+
+      "arguments": {
+        // Sem x-message-ttl: mensagens mortas devem ser analisadas manualmente
+      },
+
+      "consumer": "devops-monitoring (manual/alerting)",
+      "nota": "Em caso de crescimento anormal desta fila, verificar: (1) falha de DB causando NACKs em loop, (2) schema inválido de GpsEvent chegando na fila, (3) bug no tracking-worker"
+    }
+  ],
+
+  // ---------------------------------------------------------------------------
+  // BINDINGS
+  // Bindings conectam exchanges a filas via routing keys.
+  // O RabbitMQ usa os bindings para determinar para qual fila rotear cada mensagem.
+  // ---------------------------------------------------------------------------
+  "bindings": [
+    {
+      "source_exchange": "tx.logistics.main",
+      "destination_queue": "q.pinheirinho.gps.raw",
+      "routing_key": "pinheirinho.gps.raw",
+      "description": "Roteia coordenadas GPS brutas da API de Ingestão para o tracking-worker. A API publica com exatamente esta routing key após: (1) validar GpsEvent v1.0.0 contra o JSON Schema, (2) checar idempotência Redis ({veiculo_id}:{timestamp}).",
+      "publisher": "api-ingestao"
+    },
+    {
+      "source_exchange": "tx.logistics.main",
+      "destination_queue": "q.pinheirinho.alert.geofence",
+      "routing_key": "pinheirinho.alert.geofence",
+      "description": "Roteia alertas de geofence do tracking-worker para o notification-service. O worker publica aqui quando ST_Within(geofence_pinheirinho, ponto_gps) = TRUE (PostGIS). O notification-service emite evento 'alerta_geofence' via Socket.io ao frontend.",
+      "publisher": "tracking-worker"
+    },
+    {
+      "source_exchange": "tx.logistics.dlx",
+      "destination_queue": "q.logistics.dead-letter",
+      "routing_key": "#",
+      // "#" no tipo direct funciona como wildcard: captura QUALQUER routing key
+      // Isso garante que TODAS as dead letters (de qualquer fila) cheguem aqui,
+      // independente da routing key específica configurada em x-dead-letter-routing-key.
+      "description": "Captura todas as mensagens mortas de qualquer fila do sistema. O wildcard '#' garante que nenhuma dead letter seja perdida, independente da routing key de origem."
+    }
+  ],
+
+  // ---------------------------------------------------------------------------
+  // POLÍTICAS DE RESILIÊNCIA
+  // Documentação das decisões de design para tolerância a falhas.
+  // Referência: .agents/emergency-protocol.md
+  // ---------------------------------------------------------------------------
+  "politicas_de_resiliencia": {
+    "prefetch_count": {
+      "valor_recomendado": 10,
+      "descricao": "tracking-worker processa até 10 mensagens por vez. Balanceia throughput e memória. Em picos de GPS, aumentar para 50 com monitoramento de lag."
+    },
+    "reconexao_api": {
+      "estrategia": "Exponential Backoff",
+      "descricao": "Em caso de ECONNREFUSED ao RabbitMQ, a API de Ingestão aguarda 1s, 2s, 4s... até máximo de 30s entre tentativas. Previne DoS contra o broker durante restart. Ativa buffer em memória local enquanto broker está offline."
+    },
+    "persistencia_mensagens": {
+      "delivery_mode": 2,
+      "descricao": "Todas as mensagens publicadas devem usar delivery_mode=2 (persistent). Garante que o broker grave em disco antes de confirmar o publish, evitando perda de dados em crash do RabbitMQ."
+    }
+  }
+}

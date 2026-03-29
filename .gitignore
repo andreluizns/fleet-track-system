@@ -1,0 +1,32 @@
+# Dependências
+node_modules/
+
+# Build
+dist/
+.next/
+out/
+
+# Variáveis de ambiente — NUNCA commitar
+.env
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Cobertura de testes
+coverage/
+
+# Claude Code
+.agents/
+.claude/
+.skills/
