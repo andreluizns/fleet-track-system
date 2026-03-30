@@ -88,8 +88,10 @@ Containers iniciados: `rabbitmq`, `postgres`, `redis`, `prometheus`, `grafana`, 
 
 ```bash
 # Cria exchange, filas e bindings (idempotente — pode rodar múltiplas vezes)
-bash infrastructure/scripts/setup-rabbitmq.sh
+RABBITMQ_USER=<seu_usuario> RABBITMQ_PASS=<sua_senha> bash infrastructure/scripts/setup-rabbitmq.sh
 ```
+
+> **Atenção:** o script usa `guest/guest` por padrão, mas o container sobe com as credenciais definidas em `infrastructure/.env`. Substitua `<seu_usuario>` e `<sua_senha>` pelos valores de `RABBITMQ_USER` e `RABBITMQ_PASS` do seu `.env`, caso contrário o script retornará HTTP 401 em todas as tentativas.
 
 ### 4. API de Ingestão GPS — Terminal 1
 
